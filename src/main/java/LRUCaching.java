@@ -15,11 +15,20 @@ public class LRUCaching {
     private static long misses = 1;
     private static long overflow = Long.MAX_VALUE - 100;  // give some buffer before overflow
     // record lastResetTime for stats reset
-    private static java.util.GregorianCalendar  lastResetTime = new java.util.GregorianCalendar();
+    private static GregorianCalendar  lastResetTime = new GregorianCalendar();
 
+    /**
+     * put a key-value pair into cache
+     * @param key
+     * @param value
+     */
     public static synchronized void put(String key, String value) {
         cache.put(key, value);
     }
+
+    /**
+     * get value from cache, if not found, return null
+     */
     public static synchronized String get(String key) {
         checkHitsMissesOverflow();
         if (cache.containsKey(key)) {
@@ -30,6 +39,7 @@ public class LRUCaching {
             return null;
         }
     }
+
     public static synchronized void remove(String key) {
         cache.remove(key);
     }
@@ -44,7 +54,10 @@ public class LRUCaching {
         }
     }
 
-    private static synchronized void resetStats() {
+    /**
+     * Reset stats, and save reset time.
+     */
+    private static void resetStats() {
         lastResetTime = new java.util.GregorianCalendar();
         hits = 1;
         misses = 1;
@@ -85,12 +98,16 @@ public class LRUCaching {
         String arg2 = args[1];
         int numKeys = Integer.parseInt(arg1);
         int numAccess = Integer.parseInt(arg2);
+        // seed the cache with numKeys keys
         for (int i = 0; i < numKeys; i++) {
             LRUCaching.put(String.valueOf(i), String.valueOf(i));
         }
-        System.out.println("Starting hits stats: " + LRUCaching.getStats().toString(2));
+        // access the cache numAccess times
+        System.out.println("Init hits stats: " + LRUCaching.getStats().toString(2));
         for (int i = 0; i < numAccess; i++) {
-            LRUCaching.get(String.valueOf(i % (numKeys + 100)));  // test some misses
+            // generate a random number between 0 and (numkeys + 100) to test some misses
+            int randKey = (int)(Math.random() * (numKeys + 100));
+            LRUCaching.get(String.valueOf(randKey));
         }
         System.out.println("Ending hits stats: " + LRUCaching.getStats().toString(2));
     }
