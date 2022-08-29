@@ -6,17 +6,24 @@ import java.nio.charset.StandardCharsets;
 import java.security.KeyStore;
 
 import org.apache.http.Header;
+import org.apache.http.HeaderElement;
+import org.apache.http.HeaderElementIterator;
+import org.apache.http.HttpResponse;
 import org.apache.http.client.config.RequestConfig;
 import org.apache.http.client.methods.CloseableHttpResponse;
 import org.apache.http.client.methods.HttpGet;
 import org.apache.http.client.methods.HttpPost;
 import org.apache.http.config.Registry;
 import org.apache.http.config.RegistryBuilder;
+import org.apache.http.conn.ConnectionKeepAliveStrategy;
 import org.apache.http.conn.socket.ConnectionSocketFactory;
 import org.apache.http.conn.ssl.SSLConnectionSocketFactory;
 import org.apache.http.entity.StringEntity;
 import org.apache.http.impl.client.*;
 import org.apache.http.impl.conn.PoolingHttpClientConnectionManager;
+import org.apache.http.message.BasicHeaderElementIterator;
+import org.apache.http.protocol.HTTP;
+import org.apache.http.protocol.HttpContext;
 import org.apache.http.util.EntityUtils;
 
 /**
@@ -31,6 +38,7 @@ public class HttpMTLSClient {
     private static PoolingHttpClientConnectionManager cm = null;
 
     private static final String KEYSTORE_TYPE = "pkcs12";
+    private static final String TLS_VERSION = "TLSv1.3";
     private int MAX_CONN_SIZE = 100;
     private int MAX_CONN_PER_ROUTE = 10;
     private int VALIDATE_INACTIVITY_INTERVAL_MS = 10000;
@@ -80,7 +88,7 @@ public class HttpMTLSClient {
         kmf.init(getClientKeyStore(clientKeyStorePath, clientKeyStorePassword), clientKeyStorePasswordChars);
         TrustManagerFactory tmf = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm());
         tmf.init(getServerTrustStore(serverTrustStorePath));
-        sslContext = SSLContext.getInstance("TLSv1.3");
+        sslContext = SSLContext.getInstance(TLS_VERSION);
         sslContext.init(kmf.getKeyManagers(), tmf.getTrustManagers(), null);
         return sslContext;
     }
@@ -93,7 +101,7 @@ public class HttpMTLSClient {
             return cm;
         }
         SSLContext sslContext = getSSLContext();
-        SSLConnectionSocketFactory sslsf = new SSLConnectionSocketFactory(sslContext, new String[]{"TLSv1.3"}, null,
+        SSLConnectionSocketFactory sslsf = new SSLConnectionSocketFactory(sslContext, new String[]{TLS_VERSION}, null,
                 SSLConnectionSocketFactory.getDefaultHostnameVerifier());
         Registry<ConnectionSocketFactory> socketFactoryRegistry = RegistryBuilder.<ConnectionSocketFactory>create()
                 .register("https", sslsf)
@@ -111,6 +119,25 @@ public class HttpMTLSClient {
 
     public CloseableHttpClient getHttpClient(int getClientConnTimeout, int serverConnTimeout, int serverReadTimeout) throws Exception {
         PoolingHttpClientConnectionManager cm = getPoolingHttpClientConnectionManager();
+        // a better keepalive strategy, which is based on server response header
+        // when response does not have keepa-live header, it will default to 5 seconds.
+        ConnectionKeepAliveStrategy myStrategy = new ConnectionKeepAliveStrategy() {
+            @Override
+            public long getKeepAliveDuration(HttpResponse response, HttpContext context) {
+                HeaderElementIterator it = new BasicHeaderElementIterator
+                        (response.headerIterator(HTTP.CONN_KEEP_ALIVE));
+                while (it.hasNext()) {
+                    HeaderElement he = it.nextElement();
+                    String param = he.getName();
+                    String value = he.getValue();
+                    if (value != null && param.equalsIgnoreCase
+                            ("timeout")) {
+                        return Long.parseLong(value) * 1000;
+                    }
+                }
+                return 5 * 1000;
+            }
+        };
 
         DefaultHttpRequestRetryHandler retryHandler = new DefaultHttpRequestRetryHandler(NUM_CONN_RETRIES, true);
         RequestConfig requestConfig = RequestConfig.custom()
@@ -121,7 +148,7 @@ public class HttpMTLSClient {
 
         HttpClientBuilder httpClientBuilder = HttpClients.custom()
                 .setConnectionManager(cm)
-                .setKeepAliveStrategy(new DefaultConnectionKeepAliveStrategy())
+                .setKeepAliveStrategy(myStrategy)
                 .setRetryHandler(retryHandler)
                 .setConnectionTimeToLive(60, java.util.concurrent.TimeUnit.SECONDS)
         //        .disableCookieManagement()    // do not disable cookie for server affinity in load balancer
