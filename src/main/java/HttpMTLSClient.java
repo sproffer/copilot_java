@@ -4,6 +4,7 @@ import javax.net.ssl.TrustManagerFactory;
 import java.io.FileInputStream;
 import java.nio.charset.StandardCharsets;
 import java.security.KeyStore;
+import java.util.concurrent.TimeUnit;
 
 import org.apache.http.Header;
 import org.apache.http.HeaderElement;
@@ -31,16 +32,22 @@ import org.apache.http.util.EntityUtils;
  * SSL KeyStore is using PKCS12 format.
  */
 public class HttpMTLSClient {
-    String clientKeyStorePassword = "myclient";
-    String clientKeyStorePath = "/Users/garyzhu/mykeystore.pkcs12";
+    // get client keystore password from java property CLIENT_KEYSTORE_PASSWORD
+    private static final String clientKeyStorePassword = System.getProperty("CLIENT_KEYSTORE_PASSWORD");
+    // get client keystore path from java property CLIENT_KEYSTORE_PATH
+    private static final String clientKeyStorePath = System.getProperty("CLIENT_KEYSTORE_PATH");
+    // get authorization header from java property AUTHORIZATION_HEADER
+    private static final String authorizationHeader = System.getProperty("AUTHORIZATION_HEADER");
+
     String serverTrustStorePath = null;
     private static SSLContext sslContext = null;
     private static PoolingHttpClientConnectionManager cm = null;
 
     private static final String KEYSTORE_TYPE = "pkcs12";
     private static final String TLS_VERSION = "TLSv1.3";
-    private int MAX_CONN_SIZE = 100;
-    private int MAX_CONN_PER_ROUTE = 10;
+    private int MAX_CONN_SIZE = 20;
+    private int MAX_CONN_PER_ROUTE = 4;
+    private int DEFAULT_KEEP_ALIVE = 30000;  // 30 seconds
     private int VALIDATE_INACTIVITY_INTERVAL_MS = 10000;
     private int NUM_CONN_RETRIES = 2;
 
@@ -120,7 +127,7 @@ public class HttpMTLSClient {
     public CloseableHttpClient getHttpClient(int getClientConnTimeout, int serverConnTimeout, int serverReadTimeout) throws Exception {
         PoolingHttpClientConnectionManager cm = getPoolingHttpClientConnectionManager();
         // a better keepalive strategy, which is based on server response header
-        // when response does not have keepa-live header, it will default to 5 seconds.
+        // when response does not have keepa-live header, use DEFAULT_KEEP_ALIVE.
         ConnectionKeepAliveStrategy myStrategy = new ConnectionKeepAliveStrategy() {
             @Override
             public long getKeepAliveDuration(HttpResponse response, HttpContext context) {
@@ -135,7 +142,7 @@ public class HttpMTLSClient {
                         return Long.parseLong(value) * 1000;
                     }
                 }
-                return 5 * 1000;
+                return DEFAULT_KEEP_ALIVE;
             }
         };
 
@@ -150,7 +157,7 @@ public class HttpMTLSClient {
                 .setConnectionManager(cm)
                 .setKeepAliveStrategy(myStrategy)
                 .setRetryHandler(retryHandler)
-                .setConnectionTimeToLive(60, java.util.concurrent.TimeUnit.SECONDS)
+                .setConnectionTimeToLive(DEFAULT_KEEP_ALIVE, TimeUnit.MILLISECONDS)
         //        .disableCookieManagement()    // do not disable cookie for server affinity in load balancer
                 .disableRedirectHandling()
                 .setDefaultRequestConfig(requestConfig);
@@ -177,10 +184,9 @@ public class HttpMTLSClient {
         CloseableHttpClient httpClient = client.getHttpClient();
         // execute an HTTP POST request
         try {
-
             HttpGet httpGet = new HttpGet(url);
             //httpPost.addHeader("content-type", "application/json");
-            httpGet.addHeader("authorization", "Basic UkJfU0FMRVNfSFVCOm03emlwYWhraXI=");
+            httpGet.addHeader("authorization", authorizationHeader);
             //String postBody = "{\"name\":\"John\"}";
             //httpPost.setEntity(new StringEntity(postBody, StandardCharsets.UTF_8));
             CloseableHttpResponse response = httpClient.execute(httpGet);
