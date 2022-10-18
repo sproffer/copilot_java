@@ -2,14 +2,13 @@ import javax.net.ssl.KeyManagerFactory;
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.TrustManagerFactory;
 import java.io.FileInputStream;
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.security.KeyStore;
+import java.util.Calendar;
 import java.util.concurrent.TimeUnit;
 
-import org.apache.http.Header;
-import org.apache.http.HeaderElement;
-import org.apache.http.HeaderElementIterator;
-import org.apache.http.HttpResponse;
+import org.apache.http.*;
 import org.apache.http.client.config.RequestConfig;
 import org.apache.http.client.methods.CloseableHttpResponse;
 import org.apache.http.client.methods.HttpGet;
@@ -20,6 +19,7 @@ import org.apache.http.conn.ConnectionKeepAliveStrategy;
 import org.apache.http.conn.socket.ConnectionSocketFactory;
 import org.apache.http.conn.ssl.SSLConnectionSocketFactory;
 import org.apache.http.entity.StringEntity;
+import org.apache.http.impl.DefaultConnectionReuseStrategy;
 import org.apache.http.impl.client.*;
 import org.apache.http.impl.conn.PoolingHttpClientConnectionManager;
 import org.apache.http.message.BasicHeaderElementIterator;
@@ -30,6 +30,10 @@ import org.apache.http.util.EntityUtils;
 /**
  * Sample code for pooled HTTP connections, with MTLS support.
  * SSL KeyStore is using PKCS12 format.
+ *
+ * To create a PKCS12 keystore, use the following sample command:
+ *     cat client.key  client.pem  intermediate.pem > mykeycert.pem.txt
+ *     openssl pkcs12 -export -in mykeycert.pem.txt -out mykeystore.pkcs12  -name myCert -noiter -nomaciter -password pass:myPass
  */
 public class HttpMTLSClient {
     // get client keystore password from java property CLIENT_KEYSTORE_PASSWORD
@@ -44,17 +48,29 @@ public class HttpMTLSClient {
     private static PoolingHttpClientConnectionManager cm = null;
 
     private static final String KEYSTORE_TYPE = "pkcs12";
-    private static final String TLS_VERSION = "TLSv1.3";
-    private int MAX_CONN_SIZE = 20;
-    private int MAX_CONN_PER_ROUTE = 4;
-    private int DEFAULT_KEEP_ALIVE = 30000;  // 30 seconds
+    private static final String TLS_VERSION = "TLSv1.2"; // or TLSv1.3
+    private int MAX_CONN_SIZE = 8;
+    private int MAX_CONN_PER_ROUTE = 1;
+    private int DEFAULT_KEEP_ALIVE = 10000;  // 10 seconds
     private int VALIDATE_INACTIVITY_INTERVAL_MS = 10000;
     private int NUM_CONN_RETRIES = 2;
+    /**
+     *  Increase to avoid "org.apache.http.conn.ConnectionPoolTimeoutException: Timeout waiting for connection from pool"
+     */
+    private static int DEFAULT_CLIENT_GET_CONNECTION_TIMEROUT = 2000;
+    /**
+     *  Increase to avoid "org.apache.http.conn.ConnectTimeoutException: Connect to 10.10.1.1:443 [/10.10.1.1] failed"
+     */
+    private static int DEFAULT_SERVER_CONNECT_TIMEOUT = 10000;
+    /**
+     *  Increase to avoid:  "java.net.SocketTimeoutException: Read timed out"
+     */
+    private static int DEFAULT_SERVER_RESPONSE_TIMEOUT = 4000;
 
     char[] clientKeyStorePasswordChars = null;
 
-    HttpMTLSClient  singleton = null;
-    public HttpMTLSClient getInstance() {
+    static HttpMTLSClient  singleton = null;
+    static public HttpMTLSClient getInstance() {
         if (singleton == null) {
             singleton = new HttpMTLSClient();
         }
@@ -105,6 +121,7 @@ public class HttpMTLSClient {
      */
     public PoolingHttpClientConnectionManager getPoolingHttpClientConnectionManager() throws Exception {
         if (cm != null) {
+            // log("connection pool manager stats: " + cm.getTotalStats().toString());
             return cm;
         }
         SSLContext sslContext = getSSLContext();
@@ -121,14 +138,14 @@ public class HttpMTLSClient {
     }
 
     public CloseableHttpClient getHttpClient() throws Exception {
-        return getHttpClient(1000, 2000, 2000);
+        return getHttpClient(DEFAULT_CLIENT_GET_CONNECTION_TIMEROUT, DEFAULT_SERVER_CONNECT_TIMEOUT, DEFAULT_SERVER_RESPONSE_TIMEOUT);
     }
 
-    public CloseableHttpClient getHttpClient(int getClientConnTimeout, int serverConnTimeout, int serverReadTimeout) throws Exception {
+    public synchronized CloseableHttpClient getHttpClient(int getClientConnTimeout, int serverConnTimeout, int serverReadTimeout) throws Exception {
         PoolingHttpClientConnectionManager cm = getPoolingHttpClientConnectionManager();
         // a better keepalive strategy, which is based on server response header
         // when response does not have keepa-live header, use DEFAULT_KEEP_ALIVE.
-        ConnectionKeepAliveStrategy myStrategy = new ConnectionKeepAliveStrategy() {
+        ConnectionKeepAliveStrategy myKeepAliveStrategy = new ConnectionKeepAliveStrategy() {
             @Override
             public long getKeepAliveDuration(HttpResponse response, HttpContext context) {
                 HeaderElementIterator it = new BasicHeaderElementIterator
@@ -139,10 +156,37 @@ public class HttpMTLSClient {
                     String value = he.getValue();
                     if (value != null && param.equalsIgnoreCase
                             ("timeout")) {
+                        log("set keep-alive: " + value.toString());
                         return Long.parseLong(value) * 1000;
                     }
                 }
-                return DEFAULT_KEEP_ALIVE;
+                Header ka = response.getFirstHeader(HTTP.CONN_DIRECTIVE);
+                if (ka != null) {
+                    if (ka.getValue().equalsIgnoreCase("keep-alive")) {
+                        log("set default keep-alive:" + DEFAULT_KEEP_ALIVE);
+                        return DEFAULT_KEEP_ALIVE;
+                    }
+                }
+                // all other conditions, do nto keep alive
+                log("do not keep alive");
+                return 0L;
+            }
+        };
+
+        ConnectionReuseStrategy myReuseStrategy = new DefaultConnectionReuseStrategy() {
+            @Override
+            public boolean keepAlive(HttpResponse response, HttpContext context) {
+                Header[] kas = response.getHeaders(HTTP.CONN_DIRECTIVE);
+                for (int i=0; i < kas.length; i++) {
+                    Header ka = kas[i];
+                    if (ka.getValue().equalsIgnoreCase("keep-alive")) {
+                        log("reuse keep-alive");
+                        return true;
+                    }
+                }
+                // all other conditions, do nto keep alive
+                log("do not reuse keep-alive");
+                return false;
             }
         };
 
@@ -155,9 +199,10 @@ public class HttpMTLSClient {
 
         HttpClientBuilder httpClientBuilder = HttpClients.custom()
                 .setConnectionManager(cm)
-                .setKeepAliveStrategy(myStrategy)
+                .setConnectionReuseStrategy(myReuseStrategy)
+                .setKeepAliveStrategy(myKeepAliveStrategy)
                 .setRetryHandler(retryHandler)
-                .setConnectionTimeToLive(DEFAULT_KEEP_ALIVE, TimeUnit.MILLISECONDS)
+                .setConnectionTimeToLive(DEFAULT_KEEP_ALIVE, TimeUnit.MILLISECONDS)  // max time in the connection pool
         //        .disableCookieManagement()    // do not disable cookie for server affinity in load balancer
                 .disableRedirectHandling()
                 .setDefaultRequestConfig(requestConfig);
@@ -165,57 +210,129 @@ public class HttpMTLSClient {
         return httpClientBuilder.build();
     }
 
-    public static void main(String[] args) throws Exception {
-        String url = args[0];
-        // print what is default keystore type
-        System.out.println("Default keystore type: " + KeyStore.getDefaultType());
-        // print what is default keystore provider
-        System.out.println("Default keystore provider: " + KeyStore.getDefaultType());
-        // print what is default key manager factory algorithm
-        System.out.println("Default key manager factory algorithm: " + KeyManagerFactory.getDefaultAlgorithm());
-        // print what is default trust manager factory algorithm
-        System.out.println("Default trust manager factory algorithm: " + TrustManagerFactory.getDefaultAlgorithm());
-        // print what is default ssl context algorithm
-        System.out.println("Default ssl context algorithm: " + SSLContext.getDefault().getProtocol());
-        // print what is default ssl connection socket factory algorithm
-        System.out.println("Default ssl connection socket factory algorithm: " + SSLConnectionSocketFactory.getDefaultHostnameVerifier());
-
-        HttpMTLSClient client = new HttpMTLSClient();
-        CloseableHttpClient httpClient = client.getHttpClient();
-        // execute an HTTP POST request
-        try {
-            HttpGet httpGet = new HttpGet(url);
-            //httpPost.addHeader("content-type", "application/json");
-            httpGet.addHeader("authorization", authorizationHeader);
-            //String postBody = "{\"name\":\"John\"}";
-            //httpPost.setEntity(new StringEntity(postBody, StandardCharsets.UTF_8));
-            CloseableHttpResponse response = httpClient.execute(httpGet);
-            System.out.println("In the middle: connection stats: " + client.getPoolingHttpClientConnectionManager().getTotalStats().toString());
-            System.out.println("Response status: " + response.getStatusLine());
-
-            // print response headers
-            Header[] headers = response.getAllHeaders();
-            for (Header header : headers) {
-                System.out.println("    " + header.getName() + ": " + header.getValue());
-            }
-            if (response.getEntity() != null) {
-                // print the first 128 char of the response body, or the entire body if less than 128 char
-                String responseBody = EntityUtils.toString(response.getEntity());
-                if (responseBody.length() > 128) {
-                    System.out.println("Response body: " + responseBody.substring(0, 128) + "...");
-                } else {
-                    System.out.println("Response body: " + responseBody);
-                }
-            }
-            response.close();
-
-            System.out.println("Connection Manager Stats: " + client.getPoolingHttpClientConnectionManager().getTotalStats().toString());
-        } catch(Exception e) {
-            System.err.println("Exception: " + e.getMessage());
-            e.printStackTrace();
-        } finally {
-            httpClient.close();
-            System.out.println("After finally stats: " + client.getPoolingHttpClientConnectionManager().getTotalStats().toString());
+    /**
+     * get a multiline of string representation for the stack trace
+     *
+     * @param e    the exception object
+     * @param depth   stack trace up to depth, if depth==0, print the entire stack
+     * @return   string presentation of the exception
+     */
+    static private String getStackTrace(Exception e, int depth) {
+        StackTraceElement[] st = e.getStackTrace();
+        StringBuffer sb = new StringBuffer();
+        int d = st.length;
+        if (depth > 0 && depth < st.length)   d = depth;
+        sb.append(e.getClass().getName()).append("\n");
+        for (int i=0; i<d; i++) {
+            sb.append("    ").append(st[i].toString()).append("\n");
         }
+        return sb.toString();
+    }
+
+    /**
+     * get  current timestamp string
+     */
+    static private String getTimeString() {
+        Calendar cal = Calendar.getInstance();
+        return cal.getTime().toString();
+    }
+    /**
+     * format output lines
+     */
+    static synchronized void log(String s) {
+        System.out.println(getTimeString() + " Line:" + Thread.currentThread().getStackTrace()[2].getLineNumber() + " [" + Thread.currentThread().getName() + "] " + s);
+    }
+    /**
+     *  Test HttpMTLSClient
+     *  sample parameters:
+     *   -DCLIENT_KEYSTORE_PASSWORD=myPass
+     *   -DCLIENT_KEYSTORE_PATH=/Users/garyzhu/mykeystore.pkcs12
+     *   -DAUTHORIZATION_HEADER="Basic UkJf........"
+     *   HttpMTLSClient https://somewhere.garyzhu.net/test/
+     *
+     * @param args
+     * @throws Exception
+     */
+    public static void main(String[] args) throws Exception {
+        // String url = args[0];
+        // final String url = "https://www.google.com/";
+        // final String url = "https://tls13.cloudflare.com/";
+        // final String url = "https://www.baeldung.com/api/country-code/";   // with Connection: close
+        final String url = "https://apis.cmp.quantcast.com/geoip";
+        // final String url = "https://garyzhu.net/logo.gif";    // Connection: Keep-Alive, Keep-Alive: timeout=5,max=98
+        // final String url = "https://10.10.1.1/";
+
+        /**
+        // print what is default keystore type -- pkcs12
+        log("Default keystore type: " + KeyStore.getDefaultType());
+        // print what is default keystore provider  -- pkcs12
+        log("Default keystore provider: " + KeyStore.getDefaultType());
+        // print what is default key manager factory algorithm -- SunX509
+        log("Default key manager factory algorithm: " + KeyManagerFactory.getDefaultAlgorithm());
+        // print what is default trust manager factory algorithm -- PKIX
+        log("Default trust manager factory algorithm: " + TrustManagerFactory.getDefaultAlgorithm());
+        // print what is default ssl context algorithm  -- Default
+        log("Default ssl context algorithm: " + SSLContext.getDefault().getProtocol());
+        // print what is default ssl connection socket factory algorithm  -- org.apache.http.conn.ssl.DefaultHostnameVerifier
+        log("Default ssl connection socket factory algorithm: " + SSLConnectionSocketFactory.getDefaultHostnameVerifier());
+        **/
+        // execute an HTTP POST request
+        Runnable r = () -> {
+            try {
+                // do NOT close this httpclient, it is managed by Connection Manager
+                CloseableHttpClient httpClient = getInstance().getHttpClient();
+                HttpGet httpGet = new HttpGet(url);
+                CloseableHttpResponse response = null;
+                //httpPost.addHeader("content-type", "application/json");
+                httpGet.addHeader("authorization", authorizationHeader);
+                //String postBody = "{\"name\":\"John\"}";
+                //httpPost.setEntity(new StringEntity(postBody, StandardCharsets.UTF_8));
+                // below is the time actually get  a connection from the pool
+                log("Before execute HttpGet " + httpGet.toString() + " connection stats: "
+                        + getInstance().getPoolingHttpClientConnectionManager().getTotalStats().toString());
+                response = httpClient.execute(httpGet);
+                log("Finished, Response status: " + response.getStatusLine());
+
+                // print response headers
+                Header[] headers = response.getAllHeaders();
+
+                for (Header header : headers) {
+                    log("    " + header.getName() + ": " + header.getValue());
+                }
+
+                if (response.getEntity() != null) {
+                    // print the first 128 char of the response body, or the entire body if less than 128 char
+                    String responseBody = EntityUtils.toString(response.getEntity());
+                    if (responseBody.length() > 64) {
+                        log("Response body: " + responseBody.substring(0, 64) + "...");
+                    } else {
+                        log("Response body: " + responseBody);
+                    }
+                }
+                response.close();
+
+                log("Successful,  Connection Manager Stats: "
+                        + getInstance().getPoolingHttpClientConnectionManager().getTotalStats().toString());
+            } catch (Exception e) {
+                log("Failed Exception: "
+                        + e.getMessage() + " ==> " + getStackTrace(e, 0));
+            }
+        };
+        final int TCOUNT = 4;
+        Thread[] ts = new Thread[TCOUNT];
+        for (int i=0; i< TCOUNT; i++) {
+            ts[i] = new Thread(r);
+            if (i%2 == 0)   ts[i].start();
+        }
+        Thread.sleep(800);
+        System.out.println("--------------");
+        for (int i=0; i< TCOUNT; i++) {
+            if (i%2 == 1)   ts[i].start();
+        }
+        for (int i=0; i< TCOUNT; i++) {
+            ts[i].join();
+        }
+
+        Thread.sleep(3000);
     }
 }
