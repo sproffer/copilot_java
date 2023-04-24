@@ -254,11 +254,11 @@ public class HttpMTLSClient {
      * @throws Exception
      */
     public static void main(String[] args) throws Exception {
-        // String url = args[0];
+        String url = args[0];
         // final String url = "https://www.google.com/";
         // final String url = "https://tls13.cloudflare.com/";
         // final String url = "https://www.baeldung.com/api/country-code/";   // with Connection: close
-        final String url = "https://apis.cmp.quantcast.com/geoip";
+        // final String url = "https://apis.cmp.quantcast.com/geoip";  // has keep-alive header
         // final String url = "https://garyzhu.net/logo.gif";    // Connection: Keep-Alive, Keep-Alive: timeout=5,max=98
         // final String url = "https://10.10.1.1/";
 
@@ -318,7 +318,7 @@ public class HttpMTLSClient {
                         + e.getMessage() + " ==> " + getStackTrace(e, 0));
             }
         };
-        final int TCOUNT = 4;
+        final int TCOUNT = 20;
         Thread[] ts = new Thread[TCOUNT];
         for (int i=0; i< TCOUNT; i++) {
             ts[i] = new Thread(r);
